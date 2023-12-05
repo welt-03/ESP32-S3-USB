@@ -35,6 +35,7 @@ typedef struct {
     uint8_t num;     // IO号
     uint8_t clicks;  // 点击次数
     uint8_t state;   // 按键状态
+    uint8_t level;   // 按键电平
 } keypad_t;
 static keypad_t keypad;
 static esp_timer_handle_t timer_handle = NULL;
@@ -45,18 +46,27 @@ static lv_indev_t* indev_keypad = NULL;
 static void gpio_task_handler(void* arg) {
     uint8_t level;
     uint32_t io_num;
-    TickType_t tick;
+    TickType_t tick = 0;
 
     while (true) {
         if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
             // ESP_LOGI(TAG, "GPIO[%" PRIu32 "] intr, val: %d", io_num, gpio_get_level((gpio_num_t)io_num));
             level = gpio_get_level(io_num);
+            keypad.num = io_num;
+            keypad.level = level;
             if (!level) {
-                esp_timer_start_periodic(timer_handle, 50000);
-                tick = xTaskGetTickCount();
+                if (!esp_timer_is_active(timer_handle))
+                    esp_timer_start_periodic(timer_handle, 20000);
+
             } else {
-                esp_timer_stop(timer_handle);
+                if (keypad.clicks == 0)
+                    keypad.clicks++;
+                if (xTaskGetTickCount() - tick < 300)
+                    keypad.clicks++;
+                if (keypad.clicks > 0)
+                    tick = xTaskGetTickCount();
             }
+            ESP_LOGI(TAG, "keypad.clicks: %d", keypad.clicks);
             switch (io_num) {
                 case BUTTON_OK:
                     gpio_set_level(LED_GREEN, !level);
@@ -72,35 +82,43 @@ static void gpio_task_handler(void* arg) {
                     gpio_set_level(LED_GREEN, !level);
                     gpio_set_level(LED_YELLOW, !level);
                     break;
-                default:
-                    break;
             }
+            vTaskDelay(30 / portTICK_PERIOD_MS);
+            gpio_intr_enable((gpio_num_t)io_num);
         }
     }
 }
 
 static void keypad_cb(void* arg) {
-    static uint8_t count = 0;
+    static uint16_t count = 0;
 
-    switch (keypad.num) {
-        case BUTTON_OK:
-            keypad.state = LV_KEY_ENTER;
-            // gpio_set_level(LED_GREEN, HIGH);
-            // gpio_set_level(LED_YELLOW, HIGH);
-            break;
-        case BUTTON_DW:
-            keypad.state = LV_KEY_DOWN;
-            // gpio_set_level(LED_GREEN, HIGH);
-            break;
-        case BUTTON_UP:
-            keypad.state = LV_KEY_UP;
-            // gpio_set_level(LED_YELLOW, HIGH);
-            break;
-        case BUTTON_MENU:
-            keypad.state = LV_KEY_NEXT;
-            break;
-        default:
-            break;
+    count++;
+    if (count > 18) {
+        switch (keypad.num) {
+            case BUTTON_OK:
+                if (keypad.clicks == 1)
+                    keypad.state = LV_KEY_ENTER;
+                else if (keypad.clicks == 2)
+                    keypad.state = LV_KEY_ESC;
+                break;
+            case BUTTON_DW:
+                keypad.state = LV_KEY_DOWN;
+                break;
+            case BUTTON_UP:
+                keypad.state = LV_KEY_UP;
+                break;
+            case BUTTON_MENU:
+                if (keypad.clicks == 1)
+                    keypad.state = LV_KEY_NEXT;
+                else if (keypad.clicks == 2)
+                    keypad.state = LV_KEY_PREV;
+                break;
+        }
+        if (gpio_get_level(keypad.num)) {
+            esp_timer_stop(timer_handle);
+            keypad.clicks = 0;
+            count = 0;
+        }
     }
 }
 
@@ -112,7 +130,7 @@ static void keypad_cb(void* arg) {
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
     uint32_t io_num = (uint32_t)arg;
 
-    // gpio_intr_disable((gpio_num_t)io_num);
+    gpio_intr_disable((gpio_num_t)io_num);
     xQueueSendFromISR(gpio_evt_queue, &io_num, NULL);
 }
 static void lv_tick_task(void* arg) {
@@ -150,8 +168,8 @@ static void keypad_init() {
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&io_conf);
-    gpio_evt_queue = xQueueCreate(5, sizeof(uint32_t));
-    xTaskCreate(gpio_task_handler, "gpio_task", BUF_SIZE, NULL, 10, NULL);
+    gpio_evt_queue = xQueueCreate(10, sizeof(uint32_t));
+    xTaskCreate(gpio_task_handler, "gpio_task", BUF_SIZE * 2, NULL, 10, NULL);
 
     gpio_install_isr_service(0);
 
@@ -204,20 +222,39 @@ static void lvgl_init() {
 static void lvgl_app() {
     lv_obj_t* scr = lv_disp_get_scr_act(NULL);
     lv_obj_t* label = lv_label_create(scr);
-    lv_obj_t* slider = lv_slider_create(scr);
-    lv_obj_t* btn = lv_spinner_create(scr, 1000, 40);
+    lv_obj_t* slider1 = lv_slider_create(scr);
+    lv_obj_t* slider2 = lv_slider_create(scr);
+    lv_obj_t* slider3 = lv_slider_create(scr);
+    lv_obj_t* slider4 = lv_slider_create(scr);
+    lv_obj_t* spinner = lv_spinner_create(scr, 1000, 40);
     lv_obj_t* bar = lv_switch_create(scr);
     lv_group_t* group = lv_group_create();
 
-    lv_obj_set_x(btn, 100);
-    lv_obj_set_y(btn, 50);
-    lv_obj_set_x(bar, 100);
+    lv_obj_set_x(bar, 10);
     lv_obj_set_y(bar, 25);
-    lv_obj_set_style_align(slider, LV_ALIGN_CENTER, LV_STATE_DEFAULT);
-    lv_obj_set_style_width(slider, 100, LV_STATE_DEFAULT);
-    lv_obj_set_style_height(slider, 20, LV_STATE_DEFAULT);
+    lv_obj_set_style_width(slider1, 100, LV_STATE_DEFAULT);
+    lv_obj_set_style_height(slider1, 20, LV_STATE_DEFAULT);
+    lv_obj_set_style_width(slider2, 100, LV_STATE_DEFAULT);
+    lv_obj_set_style_height(slider2, 20, LV_STATE_DEFAULT);
+    lv_obj_set_style_width(slider3, 100, LV_STATE_DEFAULT);
+    lv_obj_set_style_height(slider3, 20, LV_STATE_DEFAULT);
+    lv_obj_set_style_width(slider4, 100, LV_STATE_DEFAULT);
+    lv_obj_set_style_height(slider4, 20, LV_STATE_DEFAULT);
+    lv_obj_set_x(slider1, 100);
+    lv_obj_set_y(slider1, 50);
+    lv_obj_set_x(slider2, 100);
+    lv_obj_set_y(slider2, 100);
+    lv_obj_set_x(slider3, 100);
+    lv_obj_set_y(slider3, 150);
+    lv_obj_set_x(slider4, 100);
+    lv_obj_set_y(slider4, 200);
     lv_group_add_obj(group, bar);
-    lv_group_add_obj(group, slider);
+    lv_group_add_obj(group, slider1);
+    lv_group_add_obj(group, slider2);
+    lv_group_add_obj(group, slider3);
+    lv_group_add_obj(group, slider4);
+    lv_group_add_obj(group, spinner);
+
     lv_indev_set_group(indev_keypad, group);
     lv_obj_set_style_text_color(label, lv_color_hex(0xf50057), LV_STATE_DEFAULT);
     lv_label_set_text(label, "Hello World");
