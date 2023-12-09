@@ -1,4 +1,6 @@
 
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +18,15 @@
 #include "lvgl.h"
 #include "lvgl_helpers.h"
 
+// #include "diskio_impl.h"
+// #include "diskio_sdmmc.h"
+#include "sdmmc_cmd.h"
+#include "tinyusb.h"
+#include "tusb_msc_storage.h"
+
 #define TAG "main"
+#define BASE_PATH "/sdcard"
+
 #define LV_TICK_PERIOD_MS 1
 #define LED_GREEN GPIO_NUM_15
 #define LED_YELLOW GPIO_NUM_16
@@ -43,6 +53,82 @@ static QueueHandle_t gpio_evt_queue = NULL;
 static lv_disp_t* disp = NULL;
 static lv_indev_t* indev_keypad = NULL;
 
+static void mount(void) {
+    ESP_LOGI(TAG, "Mount storage...");
+    ESP_ERROR_CHECK(tinyusb_msc_storage_mount(BASE_PATH));
+
+    // List all the files in this directory
+    ESP_LOGI(TAG, "\nls command output:");
+    struct dirent* d;
+    DIR* dh = opendir(BASE_PATH);
+    if (!dh) {
+        if (errno == ENOENT) {
+            // If the directory is not found
+            ESP_LOGE(TAG, "Directory doesn't exist %s", BASE_PATH);
+        } else {
+            // If the directory is not readable then throw error and exit
+            ESP_LOGE(TAG, "Unable to read directory %s", BASE_PATH);
+        }
+        return;
+    }
+    // While the next entry is not readable we will print directory files
+    while ((d = readdir(dh)) != NULL) {
+        printf("%s\n", d->d_name);
+    }
+    return;
+}
+static void msc_event_cb(tinyusb_msc_event_t* event) {
+    ESP_LOGI(TAG, "Storage mounted to application: %s", event->mount_changed_data.is_mounted ? "Yes" : "No");
+}
+static void tinyusb_msc_sdmmc_init(void) {
+    uint8_t attempts = 3;
+
+    sdmmc_card_t* sd_card = NULL;
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 4;
+    slot_config.clk = GPIO_NUM_36;
+    slot_config.cmd = GPIO_NUM_35;
+    slot_config.d0 = GPIO_NUM_37;
+    slot_config.d1 = GPIO_NUM_38;
+    slot_config.d2 = GPIO_NUM_33;
+    slot_config.d3 = GPIO_NUM_34;
+    // slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    sd_card = (sdmmc_card_t*)malloc(sizeof(sdmmc_card_t));
+    ESP_ERROR_CHECK(host.init());
+    ESP_ERROR_CHECK(sdmmc_host_init_slot(host.slot, (const sdmmc_slot_config_t*)&slot_config));
+    while (sdmmc_card_init(&host, sd_card)) {
+        vTaskDelay(1000 / portTICK_RATE_MS);
+        ESP_LOGE(TAG, "SD card not detected, Retrying...");
+        if (--attempts == 0) {
+            ESP_LOGE(TAG, "No SD card detected, aborting");
+            host.deinit();
+            free(sd_card);
+            return;
+        }
+    }
+    sdmmc_card_print_info(stdout, sd_card);
+
+    const tinyusb_msc_sdmmc_config_t msc_cfg = {
+        .card = sd_card,
+        .callback_mount_changed = msc_event_cb,
+        .mount_config.max_files = 5,
+    };
+    ESP_ERROR_CHECK(tinyusb_msc_storage_init_sdmmc(&msc_cfg));
+    ESP_ERROR_CHECK(tinyusb_msc_register_callback(TINYUSB_MSC_EVENT_MOUNT_CHANGED, msc_event_cb));
+
+    mount();
+
+    tinyusb_config_t tinyusb_cfg = {
+        .self_powered = true,
+        .vbus_monitor_io = GPIO_NUM_1,
+        .external_phy = false,
+    };
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tinyusb_cfg));
+}
 static void gpio_task_handler(void* arg) {
     uint8_t level;
     uint32_t io_num;
@@ -66,7 +152,6 @@ static void gpio_task_handler(void* arg) {
                 if (keypad.clicks > 0)
                     tick = xTaskGetTickCount();
             }
-            ESP_LOGI(TAG, "keypad.clicks: %d", keypad.clicks);
             switch (io_num) {
                 case BUTTON_OK:
                     gpio_set_level(LED_GREEN, !level);
@@ -93,7 +178,7 @@ static void keypad_cb(void* arg) {
     static uint16_t count = 0;
 
     count++;
-    if (count > 18) {
+    if (count > 24) {
         switch (keypad.num) {
             case BUTTON_OK:
                 if (keypad.clicks == 1)
@@ -102,10 +187,10 @@ static void keypad_cb(void* arg) {
                     keypad.state = LV_KEY_ESC;
                 break;
             case BUTTON_DW:
-                keypad.state = LV_KEY_DOWN;
+                keypad.state = LV_KEY_LEFT;
                 break;
             case BUTTON_UP:
-                keypad.state = LV_KEY_UP;
+                keypad.state = LV_KEY_RIGHT;
                 break;
             case BUTTON_MENU:
                 if (keypad.clicks == 1)
@@ -221,47 +306,15 @@ static void lvgl_init() {
 
 static void lvgl_app() {
     lv_obj_t* scr = lv_disp_get_scr_act(NULL);
+
     lv_obj_t* label = lv_label_create(scr);
-    lv_obj_t* slider1 = lv_slider_create(scr);
-    lv_obj_t* slider2 = lv_slider_create(scr);
-    lv_obj_t* slider3 = lv_slider_create(scr);
-    lv_obj_t* slider4 = lv_slider_create(scr);
-    lv_obj_t* spinner = lv_spinner_create(scr, 1000, 40);
-    lv_obj_t* bar = lv_switch_create(scr);
-    lv_group_t* group = lv_group_create();
-
-    lv_obj_set_x(bar, 10);
-    lv_obj_set_y(bar, 25);
-    lv_obj_set_style_width(slider1, 100, LV_STATE_DEFAULT);
-    lv_obj_set_style_height(slider1, 20, LV_STATE_DEFAULT);
-    lv_obj_set_style_width(slider2, 100, LV_STATE_DEFAULT);
-    lv_obj_set_style_height(slider2, 20, LV_STATE_DEFAULT);
-    lv_obj_set_style_width(slider3, 100, LV_STATE_DEFAULT);
-    lv_obj_set_style_height(slider3, 20, LV_STATE_DEFAULT);
-    lv_obj_set_style_width(slider4, 100, LV_STATE_DEFAULT);
-    lv_obj_set_style_height(slider4, 20, LV_STATE_DEFAULT);
-    lv_obj_set_x(slider1, 100);
-    lv_obj_set_y(slider1, 50);
-    lv_obj_set_x(slider2, 100);
-    lv_obj_set_y(slider2, 100);
-    lv_obj_set_x(slider3, 100);
-    lv_obj_set_y(slider3, 150);
-    lv_obj_set_x(slider4, 100);
-    lv_obj_set_y(slider4, 200);
-    lv_group_add_obj(group, bar);
-    lv_group_add_obj(group, slider1);
-    lv_group_add_obj(group, slider2);
-    lv_group_add_obj(group, slider3);
-    lv_group_add_obj(group, slider4);
-    lv_group_add_obj(group, spinner);
-
-    lv_indev_set_group(indev_keypad, group);
-    lv_obj_set_style_text_color(label, lv_color_hex(0xf50057), LV_STATE_DEFAULT);
-    lv_label_set_text(label, "Hello World");
+    lv_label_set_text(label, "hello world");
+    lv_obj_set_align(label, LV_ALIGN_CENTER);
 }
 
 void app_main() {
     keypad_init();
+    tinyusb_msc_sdmmc_init();
     lvgl_init();
 
     lvgl_app();
